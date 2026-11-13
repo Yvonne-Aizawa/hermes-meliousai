@@ -91,6 +91,25 @@ LEDGER_ENV = "HERMES_PROVIDER_FAILURE_LEDGER"
 
 FALLBACK_MODELS = ("glm-5.3-flash", "glm-5.3", "deepseek-v4.1-flash")
 
+# The only model on this Melious account whose /v1/models?include_meta=true entry reports
+# capabilities.vision (checked 2026-11-13). The GLM/deepseek ids are multimodal ELSEWHERE
+# (models.dev marks them vision-capable, so stock Hermes happily routes image analysis to
+# the main chat model) — but Melious serves them text-only and the image is silently
+# dropped: the model answers "I don't see any image". Declaring the truth here fixes both
+# the vision TOOL routing and native image embeds in the main conversation.
+VISION_MODEL = "mistral-small-3.2-24b-instruct"
+
+# Per-model capability declarations (schema of config model_overrides; plugin declaration
+# outranks the models.dev catalog): the account's chat models are text-only on Melious,
+# the one vision model is pinned with what its catalog entry reports.
+MODEL_CAPABILITIES = {
+    "glm-5.3": {"supports_vision": False},
+    "glm-5.3-flash": {"supports_vision": False},
+    "deepseek-v4.1-flash": {"supports_vision": False},
+    "deepseek-v4-flash-0731": {"supports_vision": False},
+    VISION_MODEL: {"supports_vision": True, "supports_tools": True, "context_window": 131072},
+}
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "short_threshold_tokens": 32000,
     "abort_silent_after_s": 90,
@@ -816,6 +835,15 @@ def classify_melious_error(
 class MeliousProfile(ProviderProfile):
     """Melious' behaviour on top of the generic OpenAI-wire profile."""
 
+    def default_vision_model(self) -> str | None:
+        """The account's catalog-verified vision model (see ``VISION_MODEL``).
+
+        Consulted by Hermes' vision auto-detect before falling back to the main chat
+        model, which on this provider is text-only — without this, image analysis lands
+        on a blind model that answers "I don't see any image".
+        """
+        return VISION_MODEL
+
     def create_client(self, **client_kwargs: Any) -> Any:
         if plugin_disabled():
             logger.info("melious plugin disabled by %s; using the standard client", DISABLE_ENV)
@@ -940,6 +968,7 @@ profile = MeliousProfile(
     fallback_models=FALLBACK_MODELS,
     default_aux_model="deepseek-v4.1-flash",
     default_headers={SENTINEL_HEADER: SENTINEL_VALUE},
+    model_capabilities=MODEL_CAPABILITIES,
     # A dataclass FIELD on ProviderProfile, so it must be bound here: a subclass method of
     # the same name would be shadowed by the None the dataclass writes in __init__.
     classify_api_error=classify_melious_error,

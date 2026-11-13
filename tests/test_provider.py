@@ -454,6 +454,26 @@ class StreamFailureTests(BaseCase):
         clamp_retry_after(weird)  # must not raise
 
 
+    def test_vision_routing_facts(self):
+        """The account's chat models are text-only on Melious; one vision model exists.
+
+        models.dev marks the GLM-5.3 family multimodal, so stock Hermes routes image
+        analysis (and native embeds) to the main chat model and the image is silently
+        dropped. The plugin declares the provider's own catalog truth.
+        """
+        import melious_provider as mp
+
+        self.assertEqual(mp.profile.default_vision_model(), mp.VISION_MODEL)
+        self.assertEqual(mp.VISION_MODEL, "mistral-small-3.2-24b-instruct")
+        caps = mp.MODEL_CAPABILITIES
+        for blind in ("glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash"):
+            self.assertIs(caps[blind]["supports_vision"], False, blind)
+        self.assertIs(caps[mp.VISION_MODEL]["supports_vision"], True)
+        self.assertEqual(caps[mp.VISION_MODEL]["context_window"], 131072)
+        # The declarations ride on the profile (config model_overrides still win over them).
+        self.assertIs(mp.profile.model_capabilities[mp.VISION_MODEL]["supports_vision"], True)
+
+
 class CatalogTests(BaseCase):
     def test_fetch_models_reads_the_endpoint_and_caches_per_key(self):
         import melious_provider as mp

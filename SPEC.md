@@ -415,21 +415,26 @@ plugin absorbed its jobs; 32/32 offline tests cover the new paths:
   is keyed. The 90 s fast-fail needed no move at all — `request_timeout_seconds` /
   `stale_timeout_seconds` are stock Hermes config.
 
-### Vision facts from the live catalog (2026-11-13, evening)
+### Vision facts from the live catalog (2026-11-13, evening; corrected same evening)
 
 `vision_analyze` returned "I don't see any image": Hermes routed the analysis to the main
-chat model because models.dev marks the GLM-5.3 family multimodal — but Melious serves
-those ids text-only (their own catalog reports `capabilities.vision` absent; only
-`mistral-small-3.2-24b-instruct` carries it). Fix, split by ownership:
+chat model (glm-5.3) because models.dev marks the GLM-5.3 family multimodal — but Melious
+serves **glm-5.3 text-only**. Fix, split by ownership:
 
 - **the model CHOICE** — `auxiliary.vision: {provider, model}` in `config.yaml`, the
   user-level knob (verified working: a live image test through it described the image).
 - **the FACTS** — the plugin queries `GET /v1/models?include_meta=true` (free to poll,
-  cached 1 h, keyed by home+key fingerprint): `default_vision_model()` discovers the
-  vision model live (the documented hook for "no hardcoded id can rot"; the verified
-  2026-11-13 id is the unreachable-catalog fallback), `live_context_length()` answers
-  from `_meta.context_length`, and every fetch folds the catalog's per-model
-  `vision`/`function_calling`/`context_length` into `model_capabilities` in place
-  (Hermes reads that dict fresh on every lookup). A small static block stays as the
-  pre-fetch floor — it is what corrects models.dev's false multimodal belief in a fresh
-  process before any catalog call has run, e.g. for native image embeds.
+  cached 1 h, keyed by home+key fingerprint). The authoritative image signal is
+  `_meta.input_modalities` containing "image" — "that is what the request path checks",
+  per their docs; the `capabilities.vision` flag is sparse (True for exactly one model
+  while ~19 chat models accept images, so a first probe that trusted it alone
+  undercounted and was corrected). `default_vision_model()` discovers a vision model
+  live from that signal (image-GENERATION rows excluded — they also list image input),
+  the verified 2026-11-13 id is the unreachable-catalog fallback,
+  `live_context_length()` answers from `_meta.context_length`, and every fetch folds the
+  per-model image/tools/context truth into `model_capabilities` in place (Hermes reads
+  that dict fresh on every lookup). The static floor blinds exactly one id — glm-5.3 —
+  because that is the one models.dev gets wrong for this provider; glm-5.3-flash and
+  deepseek-v4.1-flash accept images on Melious and are catalog-fed.
+  Live-verified image input on the day: glm-5.3-flash and gemma-4-31b both described the
+  test image correctly.

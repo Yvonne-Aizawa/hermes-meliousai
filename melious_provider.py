@@ -91,25 +91,24 @@ LEDGER_ENV = "HERMES_PROVIDER_FAILURE_LEDGER"
 
 FALLBACK_MODELS = ("glm-5.3-flash", "glm-5.3", "deepseek-v4.1-flash")
 
-# The account's catalog-verified vision model on 2026-11-13 — now only the FALLBACK:
-# `default_vision_model()` discovers the vision model live from
-# `GET /v1/models?include_meta=true` (free to poll, their docs) so no hardcoded id can
-# rot, and this pin is what a catalog-unreachable moment falls back to. The GLM/deepseek
-# ids are multimodal ELSEWHERE (models.dev marks them vision-capable, so stock Hermes
-# routes image analysis to the main chat model) — but Melious serves them text-only and
-# the image is silently dropped: the model answers "I don't see any image".
+# A catalog-verified vision model (2026-11-13), used ONLY as the fallback when the
+# catalog is unreachable — `default_vision_model()` discovers the vision model live from
+# `GET /v1/models?include_meta=true` so no hardcoded id can rot. Note the account has
+# many image-accepting models; the authoritative signal is `_meta.input_modalities`
+# containing "image" (what their request path checks), NOT the sparse
+# `capabilities.vision` flag (True for exactly one model while ~19 accept images).
 VISION_MODEL = "mistral-small-3.2-24b-instruct"
 
 # Pre-fetch floor for the per-model capability declarations (schema of config
 # model_overrides; plugin declaration outranks the models.dev catalog). The LIVE catalog
-# refreshes these in place on every fetch (`_refresh_model_capabilities`) — this static
-# block is what corrects models.dev's false "GLM-5.3 is multimodal" belief in a fresh
-# process before any catalog call has run (e.g. native image embeds).
+# refreshes these in place on every fetch — this static block is only what must hold
+# before any catalog call has run: glm-5.3 (the account's heavy chat model) is served
+# TEXT-ONLY on Melious while models.dev marks the GLM-5.3 family multimodal. Everything
+# else — including glm-5.3-flash and deepseek-v4.1-flash, which DO accept images on
+# Melious — comes from the catalog. VISION_MODEL keeps a floor entry so the
+# catalog-unreachable fallback still passes the vision-capability check.
 MODEL_CAPABILITIES = {
     "glm-5.3": {"supports_vision": False},
-    "glm-5.3-flash": {"supports_vision": False},
-    "deepseek-v4.1-flash": {"supports_vision": False},
-    "deepseek-v4-flash-0731": {"supports_vision": False},
     VISION_MODEL: {"supports_vision": True, "supports_tools": True, "context_window": 131072},
 }
 
@@ -859,7 +858,9 @@ class MeliousProfile(ProviderProfile):
         if getattr(self, "_vision_model_memo", None):
             return self._vision_model_memo
         for row in catalog_rows() or []:
-            if _row_capabilities(row).get("vision"):
+            # Chat models that accept image input (input_modalities is the authoritative
+            # signal; image-GENERATION rows also list image input and are excluded).
+            if _row_is_chat(row) and _row_accepts_image(row):
                 model_id = row.get("id")
                 if isinstance(model_id, str) and model_id:
                     self._vision_model_memo = model_id
@@ -967,6 +968,30 @@ def _row_capabilities(row: dict) -> dict:
     return {}
 
 
+def _row_accepts_image(row: dict) -> bool:
+    """True when the catalog says the model takes image input.
+
+    The authoritative signal is ``_meta.input_modalities`` containing "image" — "that is
+    what the request path checks", per their docs. ``capabilities.vision`` is a sparse
+    flag (True for exactly one model on this account while ~19 accept images), honored
+    only as a secondary hint.
+    """
+    meta = row.get("_meta")
+    if not isinstance(meta, dict):
+        return False
+    modalities = meta.get("input_modalities")
+    if isinstance(modalities, list) and "image" in modalities:
+        return True
+    return bool(_row_capabilities(row).get("vision"))
+
+
+def _row_is_chat(row: dict) -> bool:
+    """True for chat models (image-GENERATION rows also list image input)."""
+    meta = row.get("_meta")
+    kind = meta.get("type") if isinstance(meta, dict) else None
+    return kind in (None, "", "chat")
+
+
 def catalog_rows(*, api_key: str | None = None, base_url: str | None = None,
                  timeout: float = 8.0) -> list[dict] | None:
     """Raw ``/v1/models?include_meta=true`` rows, cached per (home, key fingerprint).
@@ -1016,8 +1041,10 @@ def _refresh_model_capabilities(rows) -> None:
             caps = _row_capabilities(row)
             meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
             entry = dict(MODEL_CAPABILITIES.get(model_id, {}))
-            if "vision" in caps:
-                entry["supports_vision"] = bool(caps["vision"])
+            if _row_is_chat(row):
+                # The provider's own truth about image input (input_modalities first:
+                # capabilities.vision is sparse — one True vs ~19 image-accepting models).
+                entry["supports_vision"] = _row_accepts_image(row)
             if "function_calling" in caps:
                 entry["supports_tools"] = bool(caps["function_calling"])
             context = meta.get("context_length")

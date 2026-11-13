@@ -455,11 +455,12 @@ class StreamFailureTests(BaseCase):
 
 
     def test_vision_routing_facts(self):
-        """The account's chat models are text-only on Melious; one vision model exists.
+        """glm-5.3 is served text-only on Melious; the image signal is input_modalities.
 
-        models.dev marks the GLM-5.3 family multimodal, so stock Hermes routes image
-        analysis (and native embeds) to the main chat model and the image is silently
-        dropped. The plugin declares the provider's own catalog truth.
+        models.dev marks the GLM-5.3 family multimodal, so stock Hermes believed the main
+        chat model could see images and silently blind-routed analysis to it. The floor
+        corrects exactly that one id — glm-5.3-flash and deepseek-v4.1-flash DO accept
+        images on Melious and get their truth from the live catalog.
         """
         import melious_provider as mp
 
@@ -469,8 +470,9 @@ class StreamFailureTests(BaseCase):
             self.assertEqual(mp.profile.default_vision_model(), mp.VISION_MODEL)
         self.assertEqual(mp.VISION_MODEL, "mistral-small-3.2-24b-instruct")
         caps = mp.MODEL_CAPABILITIES
-        for blind in ("glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash"):
-            self.assertIs(caps[blind]["supports_vision"], False, blind)
+        self.assertIs(caps["glm-5.3"]["supports_vision"], False, "the one text-only id")
+        self.assertNotIn("glm-5.3-flash", caps, "accepts images on Melious — catalog-fed")
+        self.assertNotIn("deepseek-v4.1-flash", caps, "accepts images on Melious — catalog-fed")
         self.assertIs(caps[mp.VISION_MODEL]["supports_vision"], True)
         self.assertEqual(caps[mp.VISION_MODEL]["context_window"], 131072)
         # The declarations ride on the profile (config model_overrides still win over them).
@@ -537,23 +539,35 @@ class CatalogTests(BaseCase):
     def test_default_vision_model_is_discovered_live(self):
         import melious_provider as mp
         payload = {"data": [
-            {"id": "glm-5.3", "_meta": {"capabilities": {"vision": False, "function_calling": True},
-                                         "context_length": 1000000}},
-            {"id": "qwen3-vl-8b", "_meta": {"capabilities": {"vision": True, "function_calling": True},
-                                           "context_length": 262144}},
+            {"id": "glm-5.3", "_meta": {"type": "chat", "input_modalities": ["text"],
+                                        "capabilities": {"function_calling": True},
+                                        "context_length": 1000000}},
+            # Image-GENERATION rows also list image input and must be excluded.
+            {"id": "flux-2-dev", "_meta": {"type": "image", "input_modalities": ["text", "image"]}},
+            # The authoritative signal: input_modalities. The sparse capabilities.vision
+            # flag is absent here, as it is for 18 of the 19 image-accepting models.
+            {"id": "gemma-4-31b", "_meta": {"type": "chat", "input_modalities": ["text", "image", "video"],
+                                            "capabilities": {"function_calling": True},
+                                            "context_length": 262144}},
+            # capabilities.vision-only rows (no modalities) still count, but lose to order.
+            {"id": "mistral-small-3.2-24b-instruct",
+             "_meta": {"type": "chat", "capabilities": {"vision": True}}},
         ]}
 
         with patch("urllib.request.urlopen", lambda request, timeout=None: self._urlopen_response(payload)):
             discovered = mp.profile.default_vision_model()
-        self.assertEqual(discovered, "qwen3-vl-8b", "must come from the LIVE catalog, not the static pin")
+        self.assertEqual(discovered, "gemma-4-31b",
+                         "input_modalities is the signal; image-GEN rows are excluded; first match wins")
         # Memoized: a second call does not refetch.
         with patch("urllib.request.urlopen", side_effect=AssertionError("must be memoized")):
-            self.assertEqual(mp.profile.default_vision_model(), "qwen3-vl-8b")
+            self.assertEqual(mp.profile.default_vision_model(), "gemma-4-31b")
         # The same fetch folded the catalog truth into the capability declarations.
         self.assertIs(mp.profile.model_capabilities["glm-5.3"]["supports_vision"], False)
         self.assertEqual(mp.profile.model_capabilities["glm-5.3"]["context_window"], 1000000)
-        self.assertIs(mp.profile.model_capabilities["qwen3-vl-8b"]["supports_vision"], True)
-        self.assertEqual(mp.profile.model_capabilities["qwen3-vl-8b"]["context_window"], 262144)
+        self.assertIs(mp.profile.model_capabilities["gemma-4-31b"]["supports_vision"], True)
+        self.assertEqual(mp.profile.model_capabilities["gemma-4-31b"]["context_window"], 262144)
+        self.assertIs(mp.profile.model_capabilities["mistral-small-3.2-24b-instruct"]["supports_vision"], True)
+        self.assertNotIn("flux-2-dev", mp.profile.model_capabilities)
 
     def test_default_vision_model_falls_back_when_the_catalog_is_unreachable(self):
         import melious_provider as mp

@@ -29,11 +29,24 @@ Config block, all optional, read from ``config.yaml``::
     melious_provider:
       short_threshold_tokens: 32000   # >= this goes to Melious' long queue
       abort_silent_after_s: 90        # mirrors providers."custom:melious".stale_timeout_seconds
-      retry_backoff_s: 10             # mirrors providers."custom:melious".retry_after_cap_seconds
+      retry_backoff_s: 10             # ENFORCED here: cap on the templated body retry_after
       max_attempts: 2                 # mirrors agent.api_max_retries
-      honor_retry_after: false        # templated retry_after:30 is NOT honored
+      honor_retry_after: false        # the templated retry_after:30 is capped, never honored in full
       fallback_model: deepseek-v4.1-flash
       log_level: info
+
+``retry_backoff_s`` is the one setting the plugin executes itself: Melious templates
+``retry_after: 30`` into its stream-start error while recommending a SHORT backoff, and
+stock Hermes honors a body ``retry_after`` up to 120 s — so the plugin clamps it to this
+value on every non-rate-limit Melious error it catches (rate limits keep their real
+cooldown). No core patch is needed for that.
+
+On a STOCK Hermes (no core patch) one policy knob moves to the environment: the
+stream-attempt count is read from ``HERMES_STREAM_RETRIES`` (default 2), not from
+``config.yaml`` — the ``agent.stream_retries`` config key exists only with a core patch.
+To keep the tuned "one stream attempt per API call" policy, set::
+
+    HERMES_STREAM_RETRIES=0     # in <hermes home>/.env — reaches every Hermes process
 
 The mirrored settings are read-only documentation of the policy the plugin expects from
 core: this plugin never writes ``config.yaml`` (see README). ``config_drift()`` reports
@@ -185,11 +198,28 @@ def config_drift(config: dict[str, Any] | None = None) -> list[str]:
         declared.update({k: v for k, v in block.items() if k in DEFAULT_SETTINGS and v is not None})
 
     drift: list[str] = []
+
+    def melious_provider(key: str) -> Any:
+        # The route is addressable both by its canonical profile id and by the
+        # `custom:<name>` spelling; mirror whichever one the operator actually keyed.
+        for name in ("melious", "custom:melious"):
+            node: Any = config
+            for part in ("providers", name, key):
+                if not isinstance(node, dict):
+                    node = None
+                    break
+                node = node.get(part)
+            if node is not None:
+                return node
+        return None
+
     mirrors = (
-        ("abort_silent_after_s", 'providers."custom:melious".stale_timeout_seconds',
-         core("providers", "custom:melious", "stale_timeout_seconds")),
-        ("retry_backoff_s", 'providers."custom:melious".retry_after_cap_seconds',
-         core("providers", "custom:melious", "retry_after_cap_seconds")),
+        # Keys that still exist in stock Hermes. `retry_backoff_s` is deliberately absent:
+        # the backoff cap is ENFORCED by the plugin (clamping the templated body
+        # retry_after), so there is no core key to mirror — the patch that used to own it
+        # (providers.<id>.retry_after_cap_seconds) is retired on hosts running this plugin.
+        ("abort_silent_after_s", 'providers.melious.stale_timeout_seconds (or the "custom:melious" spelling)',
+         melious_provider("stale_timeout_seconds")),
         ("max_attempts", "agent.api_max_retries", core("agent", "api_max_retries")),
     )
     for name, label, actual in mirrors:
@@ -286,6 +316,71 @@ def _error_code(exc: BaseException) -> str | None:
     return str(value) if value else None
 
 
+def _retry_backoff_cap() -> float:
+    try:
+        return float(plugin_settings()["retry_backoff_s"])
+    except (TypeError, ValueError):
+        return float(DEFAULT_SETTINGS["retry_backoff_s"])
+
+
+def clamp_retry_after(exc: BaseException) -> None:
+    """Cap a templated body ``retry_after`` at the plugin's backoff policy.
+
+    Stock Hermes honors a body ``retry_after`` (top level or nested under ``error``) up to
+    120 s. Melious templates ``retry_after: 30`` into its stream-start error while its own
+    advice is a SHORT backoff, so the retry re-enters the short queue from the prefix
+    cache. Rate-limit errors keep their full cooldown — their wait is real. This replaces
+    the retired core patch's ``providers.<id>.retry_after_cap_seconds``. Best effort:
+    never raises, never touches response headers.
+    """
+    cap = _retry_backoff_cap()
+    if cap <= 0:
+        return
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return
+    carrier = body.get("error")
+    carrier = carrier if isinstance(carrier, dict) else body
+    if "retry_after" not in carrier:
+        return
+    kind = " ".join(str(carrier.get(key) or "") for key in ("code", "type")).lower()
+    if "rate" in kind or getattr(exc, "status_code", None) == 429:
+        return
+    try:
+        value = float(carrier.get("retry_after"))
+    except (TypeError, ValueError):
+        return
+    if value > cap:
+        carrier["retry_after"] = cap
+
+
+def _failure_warning(
+    *,
+    request_id: str | None,
+    provider_request_id: str | None,
+    model: Any,
+    status: Any,
+    code: str | None,
+    est_tokens: int | None,
+    queue: str,
+    no_output_s: float | None,
+    error_type: str,
+) -> None:
+    """§P7: the paste-into-a-support-ticket one-liner, at WARNING (errors.log)."""
+    logger.warning(
+        "melious provider failure: id=%s upstream_id=%s model=%s status=%s code=%s est_tokens=%s queue=%s no_output_s=%s error=%s",
+        request_id or "-",
+        provider_request_id or "-",
+        model or "-",
+        status if status is not None else "-",
+        code or "-",
+        est_tokens if est_tokens is not None else "-",
+        queue,
+        no_output_s if no_output_s is not None else "-",
+        error_type,
+    )
+
+
 def _stamp_failure(
     exc: BaseException,
     *,
@@ -295,15 +390,16 @@ def _stamp_failure(
     queue: str,
     elapsed_s: float | None,
 ) -> None:
-    """Record the client id on the failure and emit the support one-liner.
+    """Bookkeeping for a request-time failure raised by ``create()`` itself.
 
-    Hermes' ledger writer hoists ``provider_request_id`` from the error's *response*
-    headers, so on a connect timeout — no response at all — the id this plugin generated is
-    the only one that exists and core structurally cannot record it. So this method stamps
-    it on the exception AND writes one ledger line itself (:func:`append_client_failure_record`),
-    but ONLY for the no-response case. A failure that carries a response keeps Melious' own
-    ``X-Request-ID``, which is the id support can actually look up.
+    The clamp runs first so core's backoff reads the capped value no matter which branch
+    follows. A failure with no response at all (connect timeout) is the one case where the
+    client-generated id is the only id that exists — it is stamped on the exception (so
+    even stock core's debug dump records it: ``_api_error_debug_info`` reads the
+    ``request_id`` attribute) and written as this plugin's ledger line. A failure that
+    carries a response keeps Melious' own ``X-Request-ID``, which core already records.
     """
+    clamp_retry_after(exc)
     no_response = getattr(exc, "response", None) is None
     if request_id:
         try:
@@ -318,7 +414,8 @@ def _stamp_failure(
 
     no_output_s = round(elapsed_s, 1) if elapsed_s is not None else None
     if request_id and no_response:
-        append_client_failure_record(
+        append_failure_record(
+            reason="provider_connect_timeout",
             request_id=request_id,
             model=model,
             est_tokens=est_tokens,
@@ -328,48 +425,55 @@ def _stamp_failure(
             error_code=_error_code(exc),
             status=getattr(exc, "status_code", None),
         )
-
-    logger.warning(
-        "melious provider failure: id=%s model=%s status=%s code=%s est_tokens=%s queue=%s no_output_s=%s error=%s",
-        request_id or "-",
-        model or "-",
-        getattr(exc, "status_code", None) or "-",
-        _error_code(exc) or "-",
-        est_tokens if est_tokens is not None else "-",
-        queue,
-        no_output_s if no_output_s is not None else "-",
-        type(exc).__name__,
+    _failure_warning(
+        request_id=request_id,
+        provider_request_id=getattr(exc, "request_id", None),
+        model=model,
+        status=getattr(exc, "status_code", None),
+        code=_error_code(exc),
+        est_tokens=est_tokens,
+        queue=queue,
+        no_output_s=no_output_s,
+        error_type=type(exc).__name__,
     )
 
 
-def append_client_failure_record(
+def append_failure_record(
     *,
-    request_id: str,
+    reason: str,
+    request_id: str | None,
     model: Any,
     est_tokens: int | None,
     queue: str,
-    no_output_s: float | None,
-    error_type: str,
+    no_output_s: float | None = None,
+    provider_request_id: str | None = None,
+    error_type: str = "",
     error_code: str | None = None,
     status: Any = None,
+    stream: dict[str, Any] | None = None,
     base_url: str | None = None,
 ) -> None:
-    """Append ONE ledger line for a failure that arrived with no HTTP response at all.
+    """Append ONE plugin line to the shared provider-failures ledger (JSONL).
 
-    Same file and same JSON shape as the core record (``provider-failures.log``), with
-    ``source`` marking this writer: core still writes its own line for the same event, but
-    without an id, because ``_api_error_debug_info`` only hoists ``provider_request_id``
-    when the error carries a response object. One ledger, two writers, documented here and
-    in the README. Best effort: never raises.
+    Same file and same record shape as the core-side writer (on hosts that carry the
+    ``provider-request-id-and-failure-ledger`` core patch), with ``source`` marking this
+    writer — on a stock Hermes these are the only lines in the file. Two reasons:
+
+    - ``provider_connect_timeout`` — no HTTP response at all. Core structurally cannot
+      record an id here (it reads ids from response headers), so the client-generated
+      one is the only id that exists.
+    - ``provider_stream_error`` — an in-stream SSE error frame (Melious' ~240 s
+      stream-start timeout arrives this way), where the raw stream's response still
+      carries the upstream ``X-Request-ID``.
+
+    Best effort: never raises.
     """
-    import json
-
     record = {
         "ts": datetime.now().isoformat(timespec="seconds"),
-        "reason": "provider_connect_timeout",
+        "reason": reason,
         "source": f"{SLUG}-plugin",
         "request_id": request_id,
-        "provider_request_id": request_id,
+        "provider_request_id": provider_request_id or request_id,
         "model": model,
         "base_url": base_url or BASE_URL,
         "error_type": error_type,
@@ -377,8 +481,18 @@ def append_client_failure_record(
         "status": status,
         "queue": queue,
         "est_tokens": est_tokens,
-        "stream": {"http_status": None, "chunks": 0, "ttfb_s": None, "no_output_s": no_output_s},
     }
+    if stream is not None or no_output_s is not None:
+        record["stream"] = stream or {
+            "http_status": None, "chunks": 0, "ttfb_s": None, "no_output_s": no_output_s,
+        }
+    _write_ledger_line(record)
+
+
+def _write_ledger_line(record: dict[str, Any]) -> None:
+    """Append one JSON line to the ledger, rotating at the same 5 MiB budget core uses."""
+    import json
+
     try:
         path = ledger_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -387,7 +501,7 @@ def append_client_failure_record(
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     except Exception:
-        logger.debug("melious: could not append the client ledger record", exc_info=True)
+        logger.debug("melious: could not append the ledger record", exc_info=True)
 
 
 def _fingerprint(key: str) -> str:
@@ -397,6 +511,135 @@ def _fingerprint(key: str) -> str:
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
+class MeliousStreamProxy:
+    """Transparent pass-through of the SDK Stream that owns failure bookkeeping.
+
+    Everything on the happy path is untouched: core iterates this proxy exactly as it
+    iterated the raw stream (``_iter_provider_stream_chunks`` is ``yield from``), reads
+    ``.response`` for headers (rate limits, Melious' ``X-Request-ID``), and reaches
+    ``get_final_message()`` / ``close()`` through the attribute passthrough — chunks
+    arrive byte-identical. When iteration raises — Melious' ~240 s stream-start timeout
+    arrives as an SSE error frame inside an HTTP 200, and the SDK raises it with no
+    ``.response`` of its own — the raw stream's response is the only place the upstream id
+    still exists. The proxy records both ids in the ledger, stamps the upstream id onto
+    the exception (stock core's debug dump reads the ``request_id`` attribute), and clamps
+    the templated ``retry_after``. This is the retired core patch's stream-error ledger,
+    moved to where the response object still lives.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        request_id: str | None,
+        model: Any,
+        est_tokens: int | None,
+        queue: str,
+        started: float,
+    ) -> None:
+        self._stream = stream
+        self._request_id = request_id
+        self._model = model
+        self._est_tokens = est_tokens
+        self._queue = queue
+        self._started = started
+        self._chunks = 0
+        self._first_chunk: float | None = None
+
+    @property
+    def response(self) -> Any:
+        """The real response object — core's header capture must keep working."""
+        return getattr(self._stream, "response", None)
+
+    def __getattr__(self, name: str) -> Any:
+        # Anything else the SDK Stream offers (get_final_message, close, …).
+        return getattr(self._stream, name)
+
+    def __iter__(self) -> "MeliousStreamProxy":
+        return self
+
+    def __next__(self) -> Any:
+        try:
+            chunk = next(self._stream)
+        except StopIteration:
+            raise
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+        self._chunks += 1
+        if self._first_chunk is None:
+            self._first_chunk = time.monotonic()
+        return chunk
+
+    def _record_failure(self, exc: BaseException) -> None:
+        """Ledger an in-stream failure with BOTH ids, then let the error propagate.
+
+        Covers the zero-chunk silence (``chunks: 0`` + ``no_output_s`` — the
+        support-critical numbers) and partial-output failures (``ttfb_s`` set, no
+        auto-resend: a resend after output is a new, separately billed request — that
+        stays core's call).
+        """
+        response = getattr(self._stream, "response", None)
+        headers = getattr(response, "headers", None)
+        upstream: str | None = None
+        open_headers: dict[str, Any] | None = None
+        try:
+            if headers is not None and hasattr(headers, "get"):
+                upstream = headers.get("x-request-id")
+                open_headers = {k: headers.get(k) for k in ("x-request-id", "server") if headers.get(k)} or None
+        except Exception:
+            logger.debug("melious: could not read the stream response headers", exc_info=True)
+
+        clamp_retry_after(exc)
+        try:
+            if upstream and not getattr(exc, "request_id", None):
+                setattr(exc, "request_id", upstream)
+        except Exception:
+            logger.debug("melious: could not stamp the upstream id on the stream error", exc_info=True)
+        if self._request_id:
+            try:
+                setattr(exc, "_melious_client_request_id", self._request_id)
+            except Exception:
+                pass
+
+        no_output_s = (
+            round(time.monotonic() - self._started, 1) if self._first_chunk is None else None
+        )
+        ttfb_s = (
+            round(self._first_chunk - self._started, 1) if self._first_chunk is not None else None
+        )
+        status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+        append_failure_record(
+            reason="provider_stream_error",
+            request_id=self._request_id,
+            provider_request_id=upstream,
+            model=self._model,
+            est_tokens=self._est_tokens,
+            queue=self._queue,
+            error_type=type(exc).__name__,
+            error_code=_error_code(exc),
+            status=status,
+            stream={
+                "http_status": getattr(response, "status_code", None),
+                "chunks": self._chunks,
+                "ttfb_s": ttfb_s,
+                "no_output_s": no_output_s,
+                "open_headers": open_headers,
+            },
+        )
+        _failure_warning(
+            request_id=self._request_id,
+            provider_request_id=upstream or getattr(exc, "request_id", None),
+            model=self._model,
+            status=status,
+            code=_error_code(exc),
+            est_tokens=self._est_tokens,
+            queue=self._queue,
+            no_output_s=no_output_s,
+            error_type=type(exc).__name__,
+        )
+
+
 class MeliousClient:
     """OpenAI-shaped client for Melious.
 
@@ -471,7 +714,7 @@ class MeliousClient:
         started = time.monotonic()
         try:
             # Pass-through: retries, prefix and response shape are untouched.
-            return client.chat.completions.create(**kwargs)
+            result = client.chat.completions.create(**kwargs)
         except Exception as exc:
             _stamp_failure(
                 exc,
@@ -482,6 +725,18 @@ class MeliousClient:
                 elapsed_s=time.monotonic() - started,
             )
             raise
+        if kwargs.get("stream"):
+            # Once iteration begins, this proxy is the only thing that still holds the
+            # response object — it owns the in-stream failure ledger (its docstring).
+            return MeliousStreamProxy(
+                result,
+                request_id=request_id,
+                model=kwargs.get("model"),
+                est_tokens=est_tokens,
+                queue=queue,
+                started=started,
+            )
+        return result
 
     def close(self) -> None:
         self._close()

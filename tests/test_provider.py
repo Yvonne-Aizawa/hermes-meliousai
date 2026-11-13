@@ -123,17 +123,26 @@ class ProfileTests(BaseCase):
             "fallback_providers": [{"provider": "custom:melious", "model": "deepseek-v4.1-flash"}],
         }
         self.assertEqual(mp.config_drift(agreeing), [])
+        # The canonical spelling (model.provider: melious) mirrors just as well.
+        canonical = {
+            "melious_provider": {"abort_silent_after_s": 90, "max_attempts": 2},
+            "providers": {"melious": {"stale_timeout_seconds": 90}},
+            "agent": {"api_max_retries": 2},
+            "fallback_providers": [{"provider": "melious", "model": "deepseek-v4.1-flash"}],
+        }
+        self.assertEqual(mp.config_drift(canonical), [])
 
         drifting = {
-            "melious_provider": {"retry_backoff_s": 30},
-            "providers": {"custom:melious": {"stale_timeout_seconds": 300, "retry_after_cap_seconds": 10}},
+            "melious_provider": {"abort_silent_after_s": 300},
+            "providers": {"custom:melious": {"stale_timeout_seconds": 90}},
             "agent": {"api_max_retries": 2},
             "fallback_providers": [],
         }
         lines = mp.config_drift(drifting)
         self.assertTrue(any("stale_timeout_seconds" in line for line in lines), lines)
-        self.assertTrue(any("retry_backoff_s" in line for line in lines), lines)
         self.assertTrue(any("fallback_model" in line for line in lines), lines)
+        # retry_backoff_s is plugin-ENFORCED (the retry_after clamp), never mirrored.
+        self.assertFalse(any("retry_backoff_s" in line for line in lines), lines)
 
 
 class ClientTests(BaseCase):
@@ -301,6 +310,148 @@ class ClientTests(BaseCase):
         kwargs = {"extra_body": "not-a-mapping"}
         self.assertIsNone(ensure_request_id(kwargs))
         self.assertEqual(kwargs["extra_body"], "not-a-mapping")
+
+
+class StreamFailureTests(BaseCase):
+    """The in-stream failure path the stream proxy owns (retired core-patch territory)."""
+
+    def _client(self):
+        from melious_provider import BASE_URL, profile
+        return profile.create_client(base_url=BASE_URL, api_key="test-key", timeout=90)
+
+    @staticmethod
+    def _sse(*frames):
+        return ("data: " + json.dumps(frame) + "\n\n" for frame in frames)
+
+    def test_in_stream_error_ledgers_both_ids_and_clamps_retry_after(self):
+        import httpx
+        import melious_provider as mp
+
+        def fake(request):
+            frame = {"error": {"message": "The model did not start responding in time. Please try again.",
+                               "type": "server_error", "code": "server_error", "retry_after": 30}}
+            payload = ("data: " + json.dumps(frame) + "\n\ndata: [DONE]\n\n").encode()
+            return httpx.Response(200, headers={"content-type": "text/event-stream",
+                                                "x-request-id": "upstream-240s"}, content=payload)
+
+        with mock_transport(fake):
+            client = self._client()
+            stream = client.chat.completions.create(
+                model="glm-5.3-flash", messages=[{"role": "user", "content": "hi"}], stream=True)
+            self.assertIsInstance(stream, mp.MeliousStreamProxy)
+            # Core's header capture keeps working through the proxy.
+            self.assertEqual(stream.response.headers.get("x-request-id"), "upstream-240s")
+            with self.assertRaises(Exception) as caught:
+                list(stream)
+            client.close()
+
+        exc = caught.exception
+        # The upstream id is stamped where stock core's debug dump reads it.
+        self.assertEqual(getattr(exc, "request_id", None), "upstream-240s")
+        self.assertEqual(exc._melious_client_request_id, client.last_request_id)
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            carrier = body.get("error") if isinstance(body.get("error"), dict) else body
+            if "retry_after" in carrier:
+                self.assertEqual(float(carrier["retry_after"]), 10.0, "templated 30s must clamp to 10s")
+
+        records = [json.loads(line) for line in mp.ledger_path().read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["reason"], "provider_stream_error")
+        self.assertEqual(record["source"], "melious-plugin")
+        self.assertEqual(record["provider_request_id"], "upstream-240s")
+        self.assertEqual(record["request_id"], client.last_request_id)
+        self.assertEqual(record["queue"], "short")
+        self.assertEqual(record["model"], "glm-5.3-flash")
+        self.assertEqual(record["stream"]["chunks"], 0)
+        self.assertIsNone(record["stream"]["ttfb_s"])
+        self.assertIsNotNone(record["stream"]["no_output_s"])
+        self.assertEqual(record["stream"]["http_status"], 200)
+        self.assertEqual(record["stream"]["open_headers"].get("x-request-id"), "upstream-240s")
+
+    def test_partial_output_failure_records_ttfb_not_no_output(self):
+        import httpx
+        import melious_provider as mp
+        good = {"id": "cmpl", "object": "chat.completion.chunk", "created": 0, "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "delta": {"content": "par"}, "finish_reason": None}]}
+        bad = {"error": {"message": "mid-stream drop", "type": "server_error", "code": "server_error"}}
+
+        def fake(request):
+            frames = self._sse(good, bad)
+            content = "".join(frames).encode() + b"data: [DONE]\n\n"
+            return httpx.Response(200, headers={"content-type": "text/event-stream",
+                                                "x-request-id": "upstream-mid"}, content=content)
+
+        with mock_transport(fake):
+            client = self._client()
+            stream = client.chat.completions.create(
+                model="glm-5.3-flash", messages=[{"role": "user", "content": "hi"}], stream=True)
+            with self.assertRaises(Exception):
+                list(stream)
+            client.close()
+
+        records = [json.loads(line) for line in mp.ledger_path().read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(records), 1)
+        stream_block = records[0]["stream"]
+        self.assertEqual(stream_block["chunks"], 1)
+        self.assertIsNotNone(stream_block["ttfb_s"])
+        self.assertIsNone(stream_block["no_output_s"], "output WAS seen; there is no 'no output' span")
+
+    def test_request_time_error_body_retry_after_is_clamped(self):
+        import httpx
+        import melious_provider as mp
+
+        def fake(request):
+            return httpx.Response(503, json={"error": {"message": "boom", "code": "provider_error",
+                                                        "retry_after": 45}})
+
+        with mock_transport(fake):
+            client = self._client()
+            with self.assertRaises(Exception) as caught:
+                client.chat.completions.create(model="glm-5.3-flash",
+                                               messages=[{"role": "user", "content": "hi"}])
+            client.close()
+
+        self.assertEqual(caught.exception.status_code, 503)
+        # The SDK may keep the envelope nested or flatten it; the clamp handles both.
+        body = caught.exception.body
+        carrier = body.get("error") if isinstance(body.get("error"), dict) else body
+        self.assertEqual(float(carrier["retry_after"]), 10.0, body)
+        # A response DID arrive: no plugin ledger line for this one.
+        self.assertFalse(mp.ledger_path().exists())
+
+    def test_retry_after_clamp_shapes_and_exemptions(self):
+        from melious_provider import clamp_retry_after
+
+        class Err(Exception):
+            pass
+
+        nested = Err()
+        nested.body = {"error": {"code": "server_error", "retry_after": 30}}
+        clamp_retry_after(nested)
+        self.assertEqual(nested.body["error"]["retry_after"], 10)
+
+        flat = Err()
+        flat.body = {"code": "server_error", "retry_after": 45}
+        clamp_retry_after(flat)
+        self.assertEqual(flat.body["retry_after"], 10)
+
+        below = Err()
+        below.body = {"error": {"code": "server_error", "retry_after": 5}}
+        clamp_retry_after(below)
+        self.assertEqual(below.body["error"]["retry_after"], 5, "never raised, only capped")
+
+        rate = Err()
+        rate.body = {"error": {"code": "rate_limit_exceeded", "type": "rate_limit_exceeded", "retry_after": 30}}
+        clamp_retry_after(rate)
+        self.assertEqual(rate.body["error"]["retry_after"], 30, "rate limits keep the real cooldown")
+
+        no_body = Err()
+        clamp_retry_after(no_body)  # must not raise
+        weird = Err()
+        weird.body = "not-a-mapping"
+        clamp_retry_after(weird)  # must not raise
 
 
 class CatalogTests(BaseCase):

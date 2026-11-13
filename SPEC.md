@@ -379,3 +379,38 @@ Two structural facts worth keeping (also in the skill reference):
 
 §6 open questions remain open — ask Melious; the answers only tune
 `short_threshold_tokens` and the backoff knobs, not the architecture.
+
+### Patch retirement (2026-11-13, later the same day)
+
+The core patch is now RETIRED on the host this was built on (reverted from the checkout,
+the `.patch` file renamed to `.patch.retired` so the reapply script skips it). The
+plugin absorbed its jobs; 32/32 offline tests cover the new paths:
+
+- **In-stream SSE error frames** (the ~240 s stream-start timeout — the patch's
+  `_attach_stream_response_headers` + stream-error ledger): the client now wraps the
+  returned Stream in a transparent `MeliousStreamProxy`. Core iterates it unchanged
+  (`_iter_provider_stream_chunks` is `yield from`), keeps reading `.response`, and reaches
+  `get_final_message()`/`close()` through the attribute passthrough. On an iteration error
+  the proxy is the only thing that still holds the response object: it records BOTH ids
+  (client `request_id` + upstream `X-Request-ID`), stamps the upstream id onto the
+  exception where stock core's `_api_error_debug_info` reads `request_id`, writes the
+  `provider_stream_error` ledger line (chunks / ttfb_s / no_output_s / open headers), and
+  clamps the templated `retry_after`. Partial-output failures ledger with `ttfb_s` and
+  no auto-resend (a resend after output is separately billed).
+- **The backoff cap** (the patch's `turn_recovery.py` change): `clamp_retry_after` caps a
+  non-rate-limit body `retry_after` at `melious_provider.retry_backoff_s` — stock core
+  honors a body `retry_after` up to 120 s (`agent.retry_utils.provider_retry_after_seconds`
+  reads top-level or `error`-nested). Rate limits keep their real cooldown.
+- **`agent.stream_retries`** (patch-only config key) → `HERMES_STREAM_RETRIES=0` in
+  `<home>/.env`; stock core reads the env var per call, and the dotenv loader puts it in
+  `os.environ` for every Hermes process (gateway, dashboard, one-shots, cron).
+- **`providers.<id>.retry_after_cap_seconds`** (patch-only) → removed; the plugin
+  enforces the cap, so `config_drift` no longer mirrors it.
+- **Intentionally dropped**: core-written ledger lines for OTHER providers' failures, and
+  the request-dump `provider_request_id` top-level hoist (the plugin's `request_id` stamp
+  reaches stock dumps through the same-named attribute).
+- **Provider id**: a model switch landed `model.provider: melious` (the profile's
+  canonical name), so the tuned keys were re-keyed to `providers."melious"`;
+  `custom:melious` remains a working alias and `config_drift` mirrors whichever spelling
+  is keyed. The 90 s fast-fail needed no move at all — `request_timeout_seconds` /
+  `stale_timeout_seconds` are stock Hermes config.

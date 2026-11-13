@@ -414,3 +414,22 @@ plugin absorbed its jobs; 32/32 offline tests cover the new paths:
   `custom:melious` remains a working alias and `config_drift` mirrors whichever spelling
   is keyed. The 90 s fast-fail needed no move at all — `request_timeout_seconds` /
   `stale_timeout_seconds` are stock Hermes config.
+
+### Vision facts from the live catalog (2026-11-13, evening)
+
+`vision_analyze` returned "I don't see any image": Hermes routed the analysis to the main
+chat model because models.dev marks the GLM-5.3 family multimodal — but Melious serves
+those ids text-only (their own catalog reports `capabilities.vision` absent; only
+`mistral-small-3.2-24b-instruct` carries it). Fix, split by ownership:
+
+- **the model CHOICE** — `auxiliary.vision: {provider, model}` in `config.yaml`, the
+  user-level knob (verified working: a live image test through it described the image).
+- **the FACTS** — the plugin queries `GET /v1/models?include_meta=true` (free to poll,
+  cached 1 h, keyed by home+key fingerprint): `default_vision_model()` discovers the
+  vision model live (the documented hook for "no hardcoded id can rot"; the verified
+  2026-11-13 id is the unreachable-catalog fallback), `live_context_length()` answers
+  from `_meta.context_length`, and every fetch folds the catalog's per-model
+  `vision`/`function_calling`/`context_length` into `model_capabilities` in place
+  (Hermes reads that dict fresh on every lookup). A small static block stays as the
+  pre-fetch floor — it is what corrects models.dev's false multimodal belief in a fresh
+  process before any catalog call has run, e.g. for native image embeds.

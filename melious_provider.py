@@ -91,17 +91,20 @@ LEDGER_ENV = "HERMES_PROVIDER_FAILURE_LEDGER"
 
 FALLBACK_MODELS = ("glm-5.3-flash", "glm-5.3", "deepseek-v4.1-flash")
 
-# The only model on this Melious account whose /v1/models?include_meta=true entry reports
-# capabilities.vision (checked 2026-11-13). The GLM/deepseek ids are multimodal ELSEWHERE
-# (models.dev marks them vision-capable, so stock Hermes happily routes image analysis to
-# the main chat model) — but Melious serves them text-only and the image is silently
-# dropped: the model answers "I don't see any image". Declaring the truth here fixes both
-# the vision TOOL routing and native image embeds in the main conversation.
+# The account's catalog-verified vision model on 2026-11-13 — now only the FALLBACK:
+# `default_vision_model()` discovers the vision model live from
+# `GET /v1/models?include_meta=true` (free to poll, their docs) so no hardcoded id can
+# rot, and this pin is what a catalog-unreachable moment falls back to. The GLM/deepseek
+# ids are multimodal ELSEWHERE (models.dev marks them vision-capable, so stock Hermes
+# routes image analysis to the main chat model) — but Melious serves them text-only and
+# the image is silently dropped: the model answers "I don't see any image".
 VISION_MODEL = "mistral-small-3.2-24b-instruct"
 
-# Per-model capability declarations (schema of config model_overrides; plugin declaration
-# outranks the models.dev catalog): the account's chat models are text-only on Melious,
-# the one vision model is pinned with what its catalog entry reports.
+# Pre-fetch floor for the per-model capability declarations (schema of config
+# model_overrides; plugin declaration outranks the models.dev catalog). The LIVE catalog
+# refreshes these in place on every fetch (`_refresh_model_capabilities`) — this static
+# block is what corrects models.dev's false "GLM-5.3 is multimodal" belief in a fresh
+# process before any catalog call has run (e.g. native image embeds).
 MODEL_CAPABILITIES = {
     "glm-5.3": {"supports_vision": False},
     "glm-5.3-flash": {"supports_vision": False},
@@ -122,9 +125,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 _MODELS_CACHE_TTL_S = 3600.0
 _models_cache: dict[tuple, tuple[float, tuple[str, ...]]] = {}
+# Raw `/v1/models?include_meta=true` rows, same scope/TTL as the id cache — the meta block
+# is the provider's own capability truth (capabilities.vision, function_calling,
+# context_length, max_output_tokens) and the endpoint is free to poll.
+_catalog_rows_cache: dict[tuple, tuple[float, tuple[dict, ...]]] = {}
 
 # Same rotation budget the core ledger writer uses, so this writer cannot grow the file.
 _LEDGER_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _catalog_scope(key: str) -> tuple:
+    return (SLUG, str(hermes_home().resolve()), _fingerprint(key))
 
 
 # ── Config / environment ──────────────────────────────────────────────────────
@@ -836,13 +847,33 @@ class MeliousProfile(ProviderProfile):
     """Melious' behaviour on top of the generic OpenAI-wire profile."""
 
     def default_vision_model(self) -> str | None:
-        """The account's catalog-verified vision model (see ``VISION_MODEL``).
+        """The account's catalog-verified vision model, discovered LIVE.
 
-        Consulted by Hermes' vision auto-detect before falling back to the main chat
-        model, which on this provider is text-only — without this, image analysis lands
-        on a blind model that answers "I don't see any image".
+        ``GET /v1/models?include_meta=true`` is the provider's own capability truth and
+        free to poll; the hook exists for exactly this ("providers that discover their
+        vision default at runtime … so no hardcoded id can rot"). Falls back to
+        ``VISION_MODEL`` (verified 2026-11-13) when the catalog is unreachable, so a
+        transient listing failure never routes vision back to the text-only main chat
+        model — the failure mode this hook exists to prevent.
         """
+        if getattr(self, "_vision_model_memo", None):
+            return self._vision_model_memo
+        for row in catalog_rows() or []:
+            if _row_capabilities(row).get("vision"):
+                model_id = row.get("id")
+                if isinstance(model_id, str) and model_id:
+                    self._vision_model_memo = model_id
+                    return model_id
         return VISION_MODEL
+
+    def live_context_length(self, model: str, *, api_key: str = "", base_url: str = "") -> int | None:
+        """Context window from the live, credentialed catalog (``_meta.context_length``)."""
+        for row in catalog_rows(api_key=api_key or None, base_url=base_url or None) or []:
+            if row.get("id") == model:
+                meta = row.get("_meta")
+                context = meta.get("context_length") if isinstance(meta, dict) else None
+                return context if isinstance(context, int) and context > 0 else None
+        return None
 
     def create_client(self, **client_kwargs: Any) -> Any:
         if plugin_disabled():
@@ -890,27 +921,28 @@ class MeliousProfile(ProviderProfile):
         if not key:
             return None
 
-        scope = (SLUG, str(hermes_home().resolve()), _fingerprint(key))
+        scope = _catalog_scope(key)
         cached = _models_cache.get(scope)
         if cached and time.monotonic() - cached[0] < _MODELS_CACHE_TTL_S:
             return list(cached[1])
 
-        items = _fetch_model_items(effective, key, timeout)
-        if items is None:
+        rows = catalog_rows(api_key=key, base_url=effective, timeout=timeout)
+        if rows is None:
             return None
-        models = _model_ids(items)
+        models = _model_ids(rows)
         if not models:
             return None
         _models_cache[scope] = (time.monotonic(), tuple(models))
         return list(models)
 
 
-def _fetch_model_items(base_url: str, api_key: str, timeout: float) -> list[Any] | None:
-    """GET {base}/models and return its row list, or None on any failure."""
+def _fetch_model_items(base_url: str, api_key: str, timeout: float, *, include_meta: bool = False) -> list[Any] | None:
+    """GET {base}/models (optionally ``?include_meta=true``) and return its row list."""
     import json
     import urllib.request
 
-    request = urllib.request.Request(base_url.rstrip("/") + "/models")
+    url = base_url.rstrip("/") + "/models" + ("?include_meta=true" if include_meta else "")
+    request = urllib.request.Request(url)
     request.add_header("Authorization", f"Bearer {api_key}")
     request.add_header("Accept", "application/json")
     request.add_header("User-Agent", f"hermes-melious-plugin/{PLUGIN_VERSION}")
@@ -925,6 +957,76 @@ def _fetch_model_items(base_url: str, api_key: str, timeout: float) -> list[Any]
     if isinstance(payload, dict) and isinstance(payload.get("data"), list):
         return payload["data"]
     return None
+
+
+def _row_capabilities(row: dict) -> dict:
+    """The row's ``_meta.capabilities`` block, or ``{}`` when absent."""
+    meta = row.get("_meta")
+    if isinstance(meta, dict) and isinstance(meta.get("capabilities"), dict):
+        return meta["capabilities"]
+    return {}
+
+
+def catalog_rows(*, api_key: str | None = None, base_url: str | None = None,
+                 timeout: float = 8.0) -> list[dict] | None:
+    """Raw ``/v1/models?include_meta=true`` rows, cached per (home, key fingerprint).
+
+    The meta block is the provider's own capability truth — the authoritative answer to
+    "what can this model do" — and the endpoint is free to poll. A route pointed at a
+    non-Melious host is not ours to catalogue. Also folds the truth into the profile's
+    ``model_capabilities`` (read fresh by Hermes on every lookup, so in-place updates
+    apply immediately).
+    """
+    requested = str(base_url or "").rstrip("/")
+    effective = requested or BASE_URL
+    if not effective.startswith(BASE_URL):
+        return None
+    key = str(api_key or "").strip() or api_key_from_env()
+    if not key:
+        return None
+
+    scope = _catalog_scope(key)
+    cached = _catalog_rows_cache.get(scope)
+    if cached and time.monotonic() - cached[0] < _MODELS_CACHE_TTL_S:
+        return list(cached[1])
+
+    items = _fetch_model_items(effective, key, timeout, include_meta=True)
+    if items is None:
+        return None
+    rows = tuple(item for item in items if isinstance(item, dict))
+    _catalog_rows_cache[scope] = (time.monotonic(), rows)
+    _refresh_model_capabilities(rows)
+    return list(rows)
+
+
+def _refresh_model_capabilities(rows) -> None:
+    """Fold the live catalog's per-model capability truth into the profile declaration.
+
+    The static ``MODEL_CAPABILITIES`` block stays as the pre-fetch floor (it corrects
+    models.dev's false "GLM-5.3 is multimodal" belief in a fresh process); this update
+    makes the catalog authoritative once fetched: a model that GAINS a capability in the
+    catalog flips its entry, and context windows come from ``_meta.context_length``
+    instead of a pinned number. Absent catalog keys leave the floor entry untouched.
+    """
+    try:
+        for row in rows:
+            model_id = row.get("id")
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            caps = _row_capabilities(row)
+            meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+            entry = dict(MODEL_CAPABILITIES.get(model_id, {}))
+            if "vision" in caps:
+                entry["supports_vision"] = bool(caps["vision"])
+            if "function_calling" in caps:
+                entry["supports_tools"] = bool(caps["function_calling"])
+            context = meta.get("context_length")
+            if isinstance(context, int) and context > 0:
+                entry["context_window"] = context
+            if entry:
+                profile.model_capabilities[model_id] = entry
+    except Exception:
+        logger.debug("melious: capability refresh failed", exc_info=True)
 
 
 def _model_ids(items: list[Any]) -> list[str]:

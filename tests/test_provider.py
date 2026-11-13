@@ -463,7 +463,10 @@ class StreamFailureTests(BaseCase):
         """
         import melious_provider as mp
 
-        self.assertEqual(mp.profile.default_vision_model(), mp.VISION_MODEL)
+        # Catalog unreachable -> the verified pin is the fallback (live discovery is
+        # covered by CatalogTests; here we pin the fallback contract).
+        with patch("urllib.request.urlopen", side_effect=OSError("offline")):
+            self.assertEqual(mp.profile.default_vision_model(), mp.VISION_MODEL)
         self.assertEqual(mp.VISION_MODEL, "mistral-small-3.2-24b-instruct")
         caps = mp.MODEL_CAPABILITIES
         for blind in ("glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash"):
@@ -475,16 +478,28 @@ class StreamFailureTests(BaseCase):
 
 
 class CatalogTests(BaseCase):
-    def test_fetch_models_reads_the_endpoint_and_caches_per_key(self):
+    def setUp(self):
+        super().setUp()
         import melious_provider as mp
-        seen: list = []
 
-        class Response:
-            def __init__(self, payload):
-                self._payload = payload
+        mp._models_cache.clear()
+        mp._catalog_rows_cache.clear()
+        snapshot = dict(mp.profile.model_capabilities)
+        self.addCleanup(lambda: (mp.profile.model_capabilities.clear(),
+                                 mp.profile.model_capabilities.update(snapshot)))
 
+        def _drop_memo():
+            if hasattr(mp.profile, "_vision_model_memo"):
+                del mp.profile._vision_model_memo
+
+        _drop_memo()
+        self.addCleanup(_drop_memo)
+
+    @staticmethod
+    def _urlopen_response(payload):
+        class Resp:
             def read(self):
-                return json.dumps(self._payload).encode()
+                return json.dumps(payload).encode()
 
             def __enter__(self):
                 return self
@@ -492,11 +507,16 @@ class CatalogTests(BaseCase):
             def __exit__(self, *exc):
                 return False
 
+        return Resp()
+
+    def test_fetch_models_reads_the_endpoint_and_caches_per_key(self):
+        import melious_provider as mp
+        seen: list = []
+
         def fake_urlopen(request, timeout=None):
             seen.append((str(request.full_url), dict(request.headers)))
-            return Response({"data": [{"id": "glm-5.3-flash"}, {"id": "deepseek-v4.1-flash"}]})
+            return self._urlopen_response({"data": [{"id": "glm-5.3-flash"}, {"id": "deepseek-v4.1-flash"}]})
 
-        mp._models_cache.clear()
         os.environ["HERMES_CUSTOM_API_MELIOUS_AI_API_KEY"] = "key-one"
         with patch("urllib.request.urlopen", fake_urlopen):
             first = mp.profile.fetch_models(base_url=mp.BASE_URL)
@@ -508,11 +528,48 @@ class CatalogTests(BaseCase):
         self.assertEqual(second, first)
         self.assertEqual(third, first)
         self.assertEqual(len(seen), 2, "the second call is served from cache")
-        self.assertEqual(seen[0][0], mp.BASE_URL + "/models")
+        self.assertEqual(seen[0][0], mp.BASE_URL + "/models?include_meta=true")
         self.assertEqual(seen[0][1].get("Authorization"), "Bearer key-one")
         # The raw key never lands in the cache structure.
         self.assertNotIn("key-one", repr(mp._models_cache))
         self.assertNotIn("key-two", repr(mp._models_cache))
+
+    def test_default_vision_model_is_discovered_live(self):
+        import melious_provider as mp
+        payload = {"data": [
+            {"id": "glm-5.3", "_meta": {"capabilities": {"vision": False, "function_calling": True},
+                                         "context_length": 1000000}},
+            {"id": "qwen3-vl-8b", "_meta": {"capabilities": {"vision": True, "function_calling": True},
+                                           "context_length": 262144}},
+        ]}
+
+        with patch("urllib.request.urlopen", lambda request, timeout=None: self._urlopen_response(payload)):
+            discovered = mp.profile.default_vision_model()
+        self.assertEqual(discovered, "qwen3-vl-8b", "must come from the LIVE catalog, not the static pin")
+        # Memoized: a second call does not refetch.
+        with patch("urllib.request.urlopen", side_effect=AssertionError("must be memoized")):
+            self.assertEqual(mp.profile.default_vision_model(), "qwen3-vl-8b")
+        # The same fetch folded the catalog truth into the capability declarations.
+        self.assertIs(mp.profile.model_capabilities["glm-5.3"]["supports_vision"], False)
+        self.assertEqual(mp.profile.model_capabilities["glm-5.3"]["context_window"], 1000000)
+        self.assertIs(mp.profile.model_capabilities["qwen3-vl-8b"]["supports_vision"], True)
+        self.assertEqual(mp.profile.model_capabilities["qwen3-vl-8b"]["context_window"], 262144)
+
+    def test_default_vision_model_falls_back_when_the_catalog_is_unreachable(self):
+        import melious_provider as mp
+        with patch("urllib.request.urlopen", side_effect=OSError("listing down")):
+            self.assertEqual(mp.profile.default_vision_model(), mp.VISION_MODEL)
+
+    def test_live_context_length_comes_from_the_catalog(self):
+        import melious_provider as mp
+        payload = {"data": [
+            {"id": "glm-5.3", "_meta": {"capabilities": {"vision": False}, "context_length": 1000000}},
+            {"id": "no-window", "_meta": {"capabilities": {}}},
+        ]}
+        with patch("urllib.request.urlopen", lambda request, timeout=None: self._urlopen_response(payload)):
+            self.assertEqual(mp.profile.live_context_length("glm-5.3"), 1000000)
+            self.assertIsNone(mp.profile.live_context_length("no-window"))
+            self.assertIsNone(mp.profile.live_context_length("not-in-catalog"))
 
     def test_fetch_models_declines_foreign_origins_and_failures(self):
         import melious_provider as mp

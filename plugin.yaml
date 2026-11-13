@@ -1,0 +1,9 @@
+name: melious
+kind: model-provider
+version: 1.0.0
+description: >-
+  Melious (api.melious.ai) — OpenAI-wire provider with client-generated request_id
+  correlation, long/short queue classification, and Melious-specific error handling.
+  Community plugin, not affiliated with Melious or Nous Research.
+author: Yvonne
+license: MIT
